@@ -35,12 +35,12 @@ public enum TranscriptRepair {
         ]
     }
 
-    /// Recovers an ending the main decode dropped.
+    /// Finishes an ending the main decode left incomplete.
     ///
-    /// The model sees 15 seconds at a time. When the last window is short it's padded with zeros, and
-    /// such a window can decode to nothing, silently losing the final words. `tail` is a re-decode of
-    /// the last 15 seconds as one full window of real audio. This only ever extends `primary`: where the
-    /// two disagree without `tail` reaching later into the audio, `primary` stands.
+    /// FluidAudio ends its last window at the final speech, which on recordings over 15 seconds often
+    /// cuts off the closing punctuation and occasionally a last word. `tail` is a re-decode of the last
+    /// 15 seconds right up to the end of the file. This only ever extends `primary`: where the two
+    /// disagree without `tail` reaching later into the audio, `primary` stands.
     public static func mergeTail(primary: [TranscriptWord], tail: [TranscriptWord]) -> [TranscriptWord] {
         guard let tailStart = tail.first?.start else { return primary }
         guard !primary.isEmpty else { return tail }
@@ -60,13 +60,37 @@ public enum TranscriptRepair {
             tailEnd > primaryEnd + Tuning.minimumTailGain,
             tailRest.count > primaryRest.count
         else {
-            return primary
+            return adoptingFinalPunctuation(of: tail, in: primary)
         }
 
         // Take the joining word from the tail too: the primary decode may have ended its sentence there.
         var merged = Array(primary[..<(run.primaryIndex + run.length)])
         merged[merged.count - 1] = tail[run.tailIndex + run.length - 1]
         return merged + tailRest
+    }
+
+    /// Takes the closing punctuation from `tail`, when both decodes end on the same word.
+    private static func adoptingFinalPunctuation(
+        of tail: [TranscriptWord],
+        in primary: [TranscriptWord]
+    ) -> [TranscriptWord] {
+        guard
+            let last = primary.last,
+            let tailLast = tail.last,
+            matches(last, tailLast),
+            !endsSentence(last),
+            endsSentence(tailLast)
+        else {
+            return primary
+        }
+
+        var result = primary
+        result[result.count - 1].text = tailLast.text
+        return result
+    }
+
+    private static func endsSentence(_ word: TranscriptWord) -> Bool {
+        word.text.last.map { ".?!".contains($0) } ?? false
     }
 
     /// Removes filler the model invented at the very end of a recording.

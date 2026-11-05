@@ -40,6 +40,35 @@ import Testing
         #expect(TranscriptRepair.mergeTail(primary: primary, tail: tail) == primary)
     }
 
+    @Test func restoresClosingPunctuationTheMainDecodeCutOff() {
+        let primary = words("we can talk about it before we move on")
+        let tail = words("about it before we move on.", from: 0.9)
+
+        #expect(joined(TranscriptRepair.mergeTail(primary: primary, tail: tail))
+            == "we can talk about it before we move on.")
+    }
+
+    @Test func restoresAQuestionMarkToo() {
+        let primary = words("what do you think")
+        let tail = words("what do you think?")
+
+        #expect(joined(TranscriptRepair.mergeTail(primary: primary, tail: tail)) == "what do you think?")
+    }
+
+    @Test func leavesExistingPunctuationAlone() {
+        let primary = words("what do you think?")
+        let tail = words("what do you think.")
+
+        #expect(TranscriptRepair.mergeTail(primary: primary, tail: tail) == primary)
+    }
+
+    @Test func doesNotTakePunctuationFromADifferentWord() {
+        let primary = words("the first part ends here")
+        let tail = words("the first part ends there.")
+
+        #expect(TranscriptRepair.mergeTail(primary: primary, tail: tail) == primary)
+    }
+
     @Test func identicalDecodesChangeNothing() {
         let primary = words("this is exactly the same text")
         #expect(TranscriptRepair.mergeTail(primary: primary, tail: primary) == primary)

@@ -21,7 +21,9 @@ func worstHealth(of path: String) throws -> InputHealth {
         return .good
     }
 
-    try file.read(into: buffer)
+    if file.length > 0 {
+        try file.read(into: buffer)
+    }
 
     var monitor = SignalMonitor()
     var worst = InputHealth.good
