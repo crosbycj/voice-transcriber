@@ -1,0 +1,6 @@
+.build/
+build/
+dist/
+.swift-home/
+Resources/Models/
+.DS_Store
