@@ -1,0 +1,362 @@
+import AppKit
+import VoiceTranscription
+
+@MainActor
+final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
+    private enum Constants {
+        static let listingTimeout: Duration = .seconds(30)
+    }
+
+    private let window: NSWindow
+    private let titleLabel = NSTextField(labelWithString: "Speech Recognition Model Required")
+    private let messageLabel = NSTextField(
+        wrappingLabelWithString: "Voice Transcriber needs to download the speech recognition model (~600MB). This only happens once."
+    )
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let progressIndicator = NSProgressIndicator()
+    private let primaryButton = NSButton(title: "Download", target: nil, action: nil)
+    private let secondaryButton = NSButton(title: "Quit", target: nil, action: nil)
+
+    private var completionContinuation: CheckedContinuation<Bool, Never>?
+    private var downloadTask: Task<Void, Never>?
+    private var listingTimeoutTask: Task<Void, Never>?
+    private var didTimeoutWhileListing = false
+    private var startDownloadAction: (() -> Void)?
+
+    override init() {
+        let contentRect = NSRect(x: 0, y: 0, width: 440, height: 220)
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+
+        self.window = window
+
+        super.init()
+
+        configureWindow()
+        configureControls()
+        buildLayout()
+        configureForPrompt()
+    }
+
+    func runDownloadModal(
+        startDownload: @escaping @Sendable (@escaping TranscriptionModelPreparationProgressHandler) async throws -> Void
+    ) async -> Bool {
+        startDownloadAction = { [weak self] in
+            guard let self else { return }
+
+            beginDownload()
+            let progressStream = AsyncStream(TranscriptionModelPreparationProgress.self) { continuation in
+                self.downloadTask = Task { [weak self] in
+                    do {
+                        try await startDownload { progress in
+                            continuation.yield(progress)
+                        }
+
+                        continuation.finish()
+
+                        await MainActor.run { [weak self] in
+                            self?.finish(with: true)
+                        }
+                    } catch is CancellationError {
+                        continuation.finish()
+
+                        await MainActor.run { [weak self] in
+                            guard let self else { return }
+                            self.downloadTask = nil
+                            if self.didTimeoutWhileListing {
+                                self.didTimeoutWhileListing = false
+                                self.handleFailure(ModelDownloadDialogError.modelServiceUnreachable)
+                            }
+                        }
+                    } catch {
+                        continuation.finish()
+
+                        await MainActor.run { [weak self] in
+                            self?.handleFailure(error)
+                        }
+                    }
+                }
+            }
+
+            Task { @MainActor [weak self] in
+                for await progress in progressStream {
+                    self?.apply(progress)
+                }
+            }
+        }
+
+        configureForPrompt()
+
+        return await withCheckedContinuation { continuation in
+            completionContinuation = continuation
+            showWindow()
+            NSApp.runModal(for: window)
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        false
+    }
+
+    private func configureWindow() {
+        window.delegate = self
+        window.title = "Voice Transcriber"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isReleasedWhenClosed = false
+        window.isMovable = true
+        window.level = .modalPanel
+        window.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+    }
+
+    private func configureControls() {
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.lineBreakMode = .byWordWrapping
+
+        messageLabel.font = .systemFont(ofSize: 13)
+        messageLabel.textColor = .secondaryLabelColor
+
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.isHidden = true
+
+        progressIndicator.controlSize = .regular
+        progressIndicator.style = .bar
+        progressIndicator.minValue = 0
+        progressIndicator.maxValue = 100
+        progressIndicator.isIndeterminate = false
+        progressIndicator.isHidden = true
+        progressIndicator.usesThreadedAnimation = true
+
+        primaryButton.target = self
+        primaryButton.action = #selector(handlePrimaryButton)
+        primaryButton.bezelStyle = .rounded
+        primaryButton.keyEquivalent = "\r"
+
+        secondaryButton.target = self
+        secondaryButton.action = #selector(handleSecondaryButton)
+        secondaryButton.bezelStyle = .rounded
+        secondaryButton.keyEquivalent = "\u{1b}"
+    }
+
+    private func buildLayout() {
+        let contentView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        window.contentView = contentView
+
+        let buttonRow = NSStackView(views: [secondaryButton, primaryButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 8
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let views: [NSView] = [titleLabel, messageLabel, statusLabel, progressIndicator, buttonRow]
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(view)
+        }
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+
+            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+            messageLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            messageLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+
+            statusLabel.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 14),
+            statusLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            statusLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+
+            progressIndicator.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            progressIndicator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            progressIndicator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+
+            buttonRow.topAnchor.constraint(greaterThanOrEqualTo: progressIndicator.bottomAnchor, constant: 18),
+            buttonRow.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.leadingAnchor, constant: 20),
+            buttonRow.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            buttonRow.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
+        ])
+    }
+
+    private func configureForPrompt() {
+        cancelListingTimeout()
+        didTimeoutWhileListing = false
+        downloadTask = nil
+        statusLabel.stringValue = ""
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.isHidden = true
+        progressIndicator.stopAnimation(nil)
+        progressIndicator.isHidden = true
+        progressIndicator.isIndeterminate = false
+        progressIndicator.doubleValue = 0
+        primaryButton.title = "Download"
+        primaryButton.isEnabled = true
+        secondaryButton.isEnabled = true
+    }
+
+    private func beginDownload() {
+        didTimeoutWhileListing = false
+        statusLabel.isHidden = false
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.stringValue = "Checking available model files..."
+        progressIndicator.isHidden = false
+        progressIndicator.isIndeterminate = true
+        progressIndicator.startAnimation(nil)
+        primaryButton.isEnabled = false
+        secondaryButton.isEnabled = true
+        scheduleListingTimeout()
+    }
+
+    private func showWindow() {
+        window.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(primaryButton)
+    }
+
+    private func apply(_ progress: TranscriptionModelPreparationProgress) {
+        guard completionContinuation != nil else { return }
+
+        statusLabel.isHidden = false
+        progressIndicator.isHidden = false
+        statusLabel.textColor = .secondaryLabelColor
+
+        switch progress.phase {
+        case .listingFiles:
+            if !progressIndicator.isIndeterminate {
+                progressIndicator.isIndeterminate = true
+            }
+            progressIndicator.startAnimation(nil)
+            statusLabel.stringValue = "Checking available model files..."
+        case .downloading(let completedFiles, let totalFiles):
+            cancelListingTimeout()
+            if progressIndicator.isIndeterminate {
+                progressIndicator.stopAnimation(nil)
+                progressIndicator.isIndeterminate = false
+            }
+            progressIndicator.doubleValue = progress.fractionCompleted * 100
+            statusLabel.stringValue = Self.downloadStatus(
+                fractionCompleted: progress.fractionCompleted,
+                completedFiles: completedFiles,
+                totalFiles: totalFiles
+            )
+        case .compiling(let modelName):
+            cancelListingTimeout()
+            if progressIndicator.isIndeterminate {
+                progressIndicator.stopAnimation(nil)
+                progressIndicator.isIndeterminate = false
+            }
+            progressIndicator.doubleValue = progress.fractionCompleted * 100
+            if modelName.isEmpty {
+                statusLabel.stringValue = "Preparing model..."
+            } else {
+                statusLabel.stringValue = "Preparing model... \(Self.percentString(progress.fractionCompleted))"
+            }
+        }
+    }
+
+    private func handleFailure(_ error: Error) {
+        guard completionContinuation != nil else { return }
+
+        cancelListingTimeout()
+        didTimeoutWhileListing = false
+        downloadTask = nil
+        statusLabel.isHidden = false
+        statusLabel.textColor = .systemRed
+        statusLabel.stringValue = error.localizedDescription
+        progressIndicator.stopAnimation(nil)
+        primaryButton.title = "Retry Download"
+        primaryButton.isEnabled = true
+        secondaryButton.isEnabled = true
+        window.makeFirstResponder(primaryButton)
+    }
+
+    private func finish(with result: Bool) {
+        guard let continuation = completionContinuation else { return }
+
+        cancelListingTimeout()
+        didTimeoutWhileListing = false
+        completionContinuation = nil
+        startDownloadAction = nil
+        downloadTask = nil
+        progressIndicator.stopAnimation(nil)
+        NSApp.stopModal()
+        window.orderOut(nil)
+        continuation.resume(returning: result)
+    }
+
+    @objc
+    private func handlePrimaryButton() {
+        guard downloadTask == nil else { return }
+        startDownloadAction?()
+    }
+
+    @objc
+    private func handleSecondaryButton() {
+        didTimeoutWhileListing = false
+        cancelListingTimeout()
+        downloadTask?.cancel()
+        finish(with: false)
+    }
+
+    private func scheduleListingTimeout() {
+        cancelListingTimeout()
+        listingTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Constants.listingTimeout)
+            } catch {
+                return
+            }
+
+            await MainActor.run { [weak self] in
+                guard let self, self.downloadTask != nil else { return }
+                self.didTimeoutWhileListing = true
+                self.downloadTask?.cancel()
+            }
+        }
+    }
+
+    private func cancelListingTimeout() {
+        listingTimeoutTask?.cancel()
+        listingTimeoutTask = nil
+    }
+
+    private static func percentString(_ fractionCompleted: Double) -> String {
+        let percent = Int((fractionCompleted * 100).rounded())
+        return "\(max(0, min(percent, 100)))%"
+    }
+
+    private static func downloadStatus(
+        fractionCompleted: Double,
+        completedFiles: Int,
+        totalFiles: Int
+    ) -> String {
+        let percent = percentString(fractionCompleted)
+
+        guard totalFiles > 0 else {
+            return "Downloading model... \(percent)"
+        }
+
+        let currentFile = min(max(completedFiles + 1, 1), totalFiles)
+        return "Downloading model... \(percent) (\(currentFile) of \(totalFiles) files)"
+    }
+}
+
+private enum ModelDownloadDialogError: LocalizedError {
+    case modelServiceUnreachable
+
+    var errorDescription: String? {
+        switch self {
+        case .modelServiceUnreachable:
+            return "Couldn't reach the speech model download service. Check your connection, VPN, or firewall, then try again."
+        }
+    }
+}
