@@ -69,8 +69,14 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
 
         guard ending.totalSamples >= Tuning.minimumSamples else { return false }
 
-        let result = try await manager.transcribe(ending.samples, source: .microphone)
+        var decoderState = freshDecoderState()
+        let result = try await manager.transcribe(ending.samples, decoderState: &decoderState)
         return !cleanEnding(of: Self.words(from: result, offset: ending.startTime), in: ending).isEmpty
+    }
+
+    /// Every decode starts clean, so nothing from one recording can leak into the next.
+    private func freshDecoderState() -> TdtDecoderState {
+        TdtDecoderState.make(decoderLayers: modelVersion.decoderLayers)
     }
 
     private func cleanEnding(of words: [TranscriptWord], in ending: AudioEnding) -> [TranscriptWord] {
@@ -92,12 +98,13 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
                 return Transcription(text: "")
             }
 
+            var decoderState = freshDecoderState()
             let primary: ASRResult
             if ending.totalSamples < Tuning.minimumSamples {
                 let padding = [Float](repeating: 0, count: Tuning.minimumSamples - ending.totalSamples)
-                primary = try await manager.transcribe(ending.samples + padding, source: .microphone)
+                primary = try await manager.transcribe(ending.samples + padding, decoderState: &decoderState)
             } else {
-                primary = try await manager.transcribe(audioFile, source: .microphone)
+                primary = try await manager.transcribe(audioFile, decoderState: &decoderState)
             }
 
             let primaryWords = Self.words(from: primary)
@@ -106,7 +113,8 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
             // Shorter recordings are a single window already, so only longer ones can lose their end.
             if ending.totalSamples > Tuning.windowSamples {
                 try Task.checkCancellation()
-                let tail = try await manager.transcribe(ending.samples, source: .microphone)
+                var tailState = freshDecoderState()
+                let tail = try await manager.transcribe(ending.samples, decoderState: &tailState)
                 words = TranscriptRepair.mergeTail(
                     primary: primaryWords,
                     tail: Self.words(from: tail, offset: ending.startTime)
@@ -182,7 +190,6 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
 
             let manager = AsrManager(config: .default)
             try await manager.loadModels(models)
-            try await manager.resetDecoderState()
             return manager
         }
 
@@ -201,7 +208,7 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
 
     private static func makeModelProgressHandler(
         _ progressHandler: TranscriptionModelPreparationProgressHandler?
-    ) -> DownloadUtils.ProgressHandler? {
+    ) -> ProgressHandler? {
         guard let progressHandler else { return nil }
 
         return { downloadProgress in

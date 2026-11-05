@@ -52,5 +52,5 @@ Each record keeps a `capture` report with the microphone used, restarts, and wor
 
 Parakeet decodes 15 seconds at a time, and two problems show up at the end of a transcript. `TranscriptRepair` handles both.
 
-- **Dropped endings.** A short final window is zero-padded and can decode to nothing, silently losing the last words. The last 15 seconds are decoded again as one full window of real audio, which can only add to what the main decode found. Padding the audio with silence is not a fix: it swaps which recordings lose their endings.
+- **Cut-off endings.** On recordings over 15 seconds, FluidAudio ends its last window at the final speech, which often loses the closing punctuation and occasionally a last word. The last 15 seconds are decoded again right up to the end of the file, and that can only add to what the main decode found. Padding the audio with silence is not a fix: it swaps which recordings lose their endings.
 - **Invented filler.** The model tends to add a stray "Yeah." in the last moments of audio. It's removed only when it's a filler word, low confidence, within half a second of the end, and quieter than speech. Requiring a filler word matters, because real last words trail off just as quietly.
