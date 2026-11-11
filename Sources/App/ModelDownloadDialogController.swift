@@ -1,26 +1,26 @@
 import AppKit
 import VoiceTranscription
 
+/// Asks to download the speech model and shows its progress.
+///
+/// This is an ordinary window the caller awaits, never `NSApp.runModal`. A modal session started from
+/// async code blocks the main actor, and the download reports progress and finishes on the main actor,
+/// so under a modal session it never even started: the dialog sat on "Checking available model files"
+/// forever.
 @MainActor
 final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
-    private enum Constants {
-        static let listingTimeout: Duration = .seconds(30)
-    }
-
     private let window: NSWindow
     private let titleLabel = NSTextField(labelWithString: "Speech Recognition Model Required")
     private let messageLabel = NSTextField(
         wrappingLabelWithString: "Voice Transcriber needs to download the speech recognition model (~600MB). This only happens once."
     )
-    private let statusLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let progressIndicator = NSProgressIndicator()
     private let primaryButton = NSButton(title: "Download", target: nil, action: nil)
     private let secondaryButton = NSButton(title: "Quit", target: nil, action: nil)
 
     private var completionContinuation: CheckedContinuation<Bool, Never>?
     private var downloadTask: Task<Void, Never>?
-    private var listingTimeoutTask: Task<Void, Never>?
-    private var didTimeoutWhileListing = false
     private var startDownloadAction: (() -> Void)?
 
     override init() {
@@ -42,7 +42,7 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
         configureForPrompt()
     }
 
-    func runDownloadModal(
+    func run(
         startDownload: @escaping @Sendable (@escaping TranscriptionModelPreparationProgressHandler) async throws -> Void
     ) async -> Bool {
         startDownloadAction = { [weak self] in
@@ -62,16 +62,8 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
                             self?.finish(with: true)
                         }
                     } catch is CancellationError {
+                        // Only Quit cancels, and it has already closed the dialog.
                         continuation.finish()
-
-                        await MainActor.run { [weak self] in
-                            guard let self else { return }
-                            self.downloadTask = nil
-                            if self.didTimeoutWhileListing {
-                                self.didTimeoutWhileListing = false
-                                self.handleFailure(ModelDownloadDialogError.modelServiceUnreachable)
-                            }
-                        }
                     } catch {
                         continuation.finish()
 
@@ -94,7 +86,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
         return await withCheckedContinuation { continuation in
             completionContinuation = continuation
             showWindow()
-            NSApp.runModal(for: window)
         }
     }
 
@@ -187,8 +178,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
     }
 
     private func configureForPrompt() {
-        cancelListingTimeout()
-        didTimeoutWhileListing = false
         downloadTask = nil
         statusLabel.stringValue = ""
         statusLabel.textColor = .secondaryLabelColor
@@ -203,7 +192,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
     }
 
     private func beginDownload() {
-        didTimeoutWhileListing = false
         statusLabel.isHidden = false
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "Checking available model files..."
@@ -212,7 +200,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
         progressIndicator.startAnimation(nil)
         primaryButton.isEnabled = false
         secondaryButton.isEnabled = true
-        scheduleListingTimeout()
     }
 
     private func showWindow() {
@@ -237,7 +224,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
             progressIndicator.startAnimation(nil)
             statusLabel.stringValue = "Checking available model files..."
         case .downloading(let completedFiles, let totalFiles):
-            cancelListingTimeout()
             if progressIndicator.isIndeterminate {
                 progressIndicator.stopAnimation(nil)
                 progressIndicator.isIndeterminate = false
@@ -249,7 +235,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
                 totalFiles: totalFiles
             )
         case .compiling(let modelName):
-            cancelListingTimeout()
             if progressIndicator.isIndeterminate {
                 progressIndicator.stopAnimation(nil)
                 progressIndicator.isIndeterminate = false
@@ -266,8 +251,6 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
     private func handleFailure(_ error: Error) {
         guard completionContinuation != nil else { return }
 
-        cancelListingTimeout()
-        didTimeoutWhileListing = false
         downloadTask = nil
         statusLabel.isHidden = false
         statusLabel.textColor = .systemRed
@@ -282,13 +265,10 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
     private func finish(with result: Bool) {
         guard let continuation = completionContinuation else { return }
 
-        cancelListingTimeout()
-        didTimeoutWhileListing = false
         completionContinuation = nil
         startDownloadAction = nil
         downloadTask = nil
         progressIndicator.stopAnimation(nil)
-        NSApp.stopModal()
         window.orderOut(nil)
         continuation.resume(returning: result)
     }
@@ -301,32 +281,8 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
 
     @objc
     private func handleSecondaryButton() {
-        didTimeoutWhileListing = false
-        cancelListingTimeout()
         downloadTask?.cancel()
         finish(with: false)
-    }
-
-    private func scheduleListingTimeout() {
-        cancelListingTimeout()
-        listingTimeoutTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: Constants.listingTimeout)
-            } catch {
-                return
-            }
-
-            await MainActor.run { [weak self] in
-                guard let self, self.downloadTask != nil else { return }
-                self.didTimeoutWhileListing = true
-                self.downloadTask?.cancel()
-            }
-        }
-    }
-
-    private func cancelListingTimeout() {
-        listingTimeoutTask?.cancel()
-        listingTimeoutTask = nil
     }
 
     private static func percentString(_ fractionCompleted: Double) -> String {
@@ -347,16 +303,5 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
 
         let currentFile = min(max(completedFiles + 1, 1), totalFiles)
         return "Downloading model... \(percent) (\(currentFile) of \(totalFiles) files)"
-    }
-}
-
-private enum ModelDownloadDialogError: LocalizedError {
-    case modelServiceUnreachable
-
-    var errorDescription: String? {
-        switch self {
-        case .modelServiceUnreachable:
-            return "Couldn't reach the speech model download service. Check your connection, VPN, or firewall, then try again."
-        }
     }
 }

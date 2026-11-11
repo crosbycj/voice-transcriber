@@ -10,16 +10,25 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
         static let windowSamples = 238_080
         /// FluidAudio refuses anything shorter.
         static let minimumSamples = sampleRate
+        /// A healthy connection lists the model's files in about two seconds and then streams bytes
+        /// constantly, so this much silence means nothing is coming back.
+        static let networkSilenceLimit: Duration = .seconds(30)
+        /// Times to resume a download that froze partway, as long as each try gets further.
+        static let downloadAttempts = 5
     }
 
     public nonisolated let modelIdentifier = "parakeet-tdt-0.6b-v3"
 
     private let modelVersion = AsrModelVersion.v3
+    private let modelDirectory: URL
     private let logger = Logger(subsystem: "com.cooper.VoiceTranscriber", category: "ParakeetTranscriptionEngine")
     private var loadTask: Task<AsrManager, Error>?
     private var lastJob: Task<Void, Never>?
 
-    public init() {}
+    /// - Parameter modelDirectory: Where the model lives. Defaults to FluidAudio's shared cache.
+    public init(modelDirectory: URL? = nil) {
+        self.modelDirectory = modelDirectory ?? AsrModels.defaultCacheDirectory(for: modelVersion)
+    }
 
     public func prepare() async throws {
         try await prepare(progressHandler: nil)
@@ -30,7 +39,7 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
     }
 
     public func modelFilesExistOnDisk() -> Bool {
-        AsrModels.modelsExist(at: AsrModels.defaultCacheDirectory(for: modelVersion), version: modelVersion)
+        AsrModels.modelsExist(at: modelDirectory, version: modelVersion)
     }
 
     public func transcribe(audioFile: URL) async throws -> Transcription {
@@ -172,62 +181,125 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
         return words
     }
 
+    /// Loads the model, downloading it first if it isn't on disk.
+    ///
+    /// Callers share one load. Cancelling the caller that started it cancels it, download included, which
+    /// is how the download dialog's Quit stops it. Later callers only wait on it.
     private func loadManager(
         progressHandler: TranscriptionModelPreparationProgressHandler? = nil
     ) async throws -> AsrManager {
+        let task: Task<AsrManager, Error>
+        let startedHere: Bool
+
         if let loadTask {
-            return try await loadTask.value
+            task = loadTask
+            startedHere = false
+        } else {
+            task = Task { [modelVersion, modelDirectory] in
+                try await Self.loadModels(version: modelVersion, directory: modelDirectory, progressHandler: progressHandler)
+            }
+            loadTask = task
+            startedHere = true
         }
 
-        let modelVersion = modelVersion
-        let task = Task { () throws -> AsrManager in
-            let directory = AsrModels.defaultCacheDirectory(for: modelVersion)
-            let handler = Self.makeModelProgressHandler(progressHandler)
+        do {
+            let manager = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                if startedHere { task.cancel() }
+            }
 
-            let models = AsrModels.modelsExist(at: directory, version: modelVersion)
-                ? try await AsrModels.load(from: directory, version: modelVersion, progressHandler: handler)
-                : try await AsrModels.downloadAndLoad(version: modelVersion, progressHandler: handler)
+            if startedHere {
+                logger.info("Parakeet ASR models are ready")
+            }
+            return manager
+        } catch {
+            // Leave the next attempt free to try again.
+            if loadTask == task {
+                loadTask = nil
+            }
+
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            if error is NetworkWatchdog.Silence || Self.isNetworkFailure(error) {
+                logger.error("Couldn't reach the model server: \(String(describing: error), privacy: .public)")
+                throw ParakeetTranscriptionEngineError.modelServerUnreachable
+            }
+            throw ParakeetTranscriptionEngineError.modelLoadingFailed(underlying: error)
+        }
+    }
+
+    private static func loadModels(
+        version: AsrModelVersion,
+        directory: URL,
+        progressHandler: TranscriptionModelPreparationProgressHandler?
+    ) async throws -> AsrManager {
+        try await NetworkWatchdog.run(limit: Tuning.networkSilenceLimit, attempts: Tuning.downloadAttempts) { report in
+            let handler: ProgressHandler = { progress in
+                switch progress.phase {
+                case .listing, .downloading:
+                    report(.network(progress: progress.fractionCompleted))
+                case .compiling:
+                    report(.local)
+                }
+                progressHandler?(preparationProgress(from: progress))
+            }
+
+            let models = AsrModels.modelsExist(at: directory, version: version)
+                ? try await AsrModels.load(from: directory, version: version, progressHandler: handler)
+                : try await AsrModels.downloadAndLoad(to: directory, version: version, progressHandler: handler)
+            report(.local)
 
             let manager = AsrManager(config: .default)
             try await manager.loadModels(models)
             return manager
         }
-
-        loadTask = task
-
-        do {
-            let manager = try await task.value
-            logger.info("Parakeet ASR models are ready")
-            return manager
-        } catch {
-            // Leave the next attempt free to try again.
-            loadTask = nil
-            throw ParakeetTranscriptionEngineError.modelLoadingFailed(underlying: error)
-        }
     }
 
-    private static func makeModelProgressHandler(
-        _ progressHandler: TranscriptionModelPreparationProgressHandler?
-    ) -> ProgressHandler? {
-        guard let progressHandler else { return nil }
+    /// Whether `error`, or anything it wraps, is the network failing rather than the model.
+    static func isNetworkFailure(_ error: Error) -> Bool {
+        let networkCodes: Set<URLError.Code> = [
+            .notConnectedToInternet, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+            .timedOut, .networkConnectionLost, .secureConnectionFailed, .internationalRoamingOff,
+            .dataNotAllowed, .cannotLoadFromNetwork,
+        ]
 
-        return { downloadProgress in
-            let phase: TranscriptionModelPreparationPhase
-
-            switch downloadProgress.phase {
-            case .listing:
-                phase = .listingFiles
-            case .downloading(let completedFiles, let totalFiles):
-                phase = .downloading(completedFiles: completedFiles, totalFiles: totalFiles)
-            case .compiling(let modelName):
-                phase = .compiling(modelName: modelName)
-            }
-
-            progressHandler(TranscriptionModelPreparationProgress(
-                fractionCompleted: downloadProgress.fractionCompleted,
-                phase: phase
-            ))
+        if case DownloadError.downloadFailed(_, let underlying) = error {
+            return isNetworkFailure(underlying)
         }
+        if case DownloadError.stalled = error {
+            return true
+        }
+
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let nsError = current, depth < 8 {
+            if nsError.domain == NSURLErrorDomain, networkCodes.contains(URLError.Code(rawValue: nsError.code)) {
+                return true
+            }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        return false
+    }
+
+    private static func preparationProgress(from downloadProgress: DownloadProgress) -> TranscriptionModelPreparationProgress {
+        let phase: TranscriptionModelPreparationPhase
+
+        switch downloadProgress.phase {
+        case .listing:
+            phase = .listingFiles
+        case .downloading(let completedFiles, let totalFiles):
+            phase = .downloading(completedFiles: completedFiles, totalFiles: totalFiles)
+        case .compiling(let modelName):
+            phase = .compiling(modelName: modelName)
+        }
+
+        return TranscriptionModelPreparationProgress(
+            fractionCompleted: downloadProgress.fractionCompleted,
+            phase: phase
+        )
     }
 }
 
@@ -269,6 +341,7 @@ private struct AudioEnding {
 
 public enum ParakeetTranscriptionEngineError: LocalizedError {
     case modelLoadingFailed(underlying: Error)
+    case modelServerUnreachable
     case transcriptionFailed(underlying: Error)
     case unreadableAudio
 
@@ -276,6 +349,8 @@ public enum ParakeetTranscriptionEngineError: LocalizedError {
         switch self {
         case .modelLoadingFailed(let underlying):
             return "Couldn't load the speech model: \(underlying.localizedDescription)"
+        case .modelServerUnreachable:
+            return "Couldn't reach the speech model server. If you're on a VPN, proxy or work network, try turning it off or switching networks, then try again."
         case .transcriptionFailed(let underlying):
             return "Couldn't transcribe the audio: \(underlying.localizedDescription)"
         case .unreadableAudio:

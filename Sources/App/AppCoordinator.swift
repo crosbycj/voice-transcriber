@@ -111,7 +111,7 @@ final class AppCoordinator: ObservableObject {
         guard await !engine.modelFilesExistOnDisk() else { return true }
 
         let dialog = ModelDownloadDialogController()
-        return await dialog.runDownloadModal { [engine] progressHandler in
+        return await dialog.run { [engine] progressHandler in
             try await engine.prepare(progressHandler: progressHandler)
         }
     }

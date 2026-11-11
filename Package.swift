@@ -63,6 +63,7 @@ let package = Package(
                 "VoiceAudio",
                 "VoiceCore",
                 "VoiceTranscription",
+                .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Tests/VoiceTests"
         ),
