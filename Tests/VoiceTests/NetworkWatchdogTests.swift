@@ -192,4 +192,23 @@ import Testing
         #expect(!ParakeetTranscriptionEngine.isNetworkFailure(DownloadError.modelNotFound(path: "x")))
         #expect(!ParakeetTranscriptionEngine.isNetworkFailure(CocoaError(.fileWriteOutOfSpace)))
     }
+
+    // MARK: Progress shown while preparing the model
+
+    private func shown(_ fraction: Double, _ phase: DownloadPhase) -> TranscriptionModelPreparationProgress {
+        ParakeetTranscriptionEngine.preparationProgress(from: DownloadProgress(fractionCompleted: fraction, phase: phase))
+    }
+
+    @Test func theDownloadFillsTheWholeBar() {
+        #expect(shown(0, .listing) == .checking)
+        #expect(shown(0.25, .downloading(completedFiles: 6, totalFiles: 23)) == .downloading(fractionCompleted: 0.5))
+        #expect(shown(0.5, .downloading(completedFiles: 23, totalFiles: 23)) == .downloading(fractionCompleted: 1))
+    }
+
+    /// FluidAudio's raw numbers sat at 50% here, then jumped between 50% and 100% for each part.
+    @Test func compilingAndItsCachedPartsAllReadAsPreparing() {
+        #expect(shown(0.5, .compiling(modelName: "Encoder.mlmodelc")) == .preparing)
+        #expect(shown(1, .compiling(modelName: "")) == .preparing)
+        #expect(shown(0.5, .downloading(completedFiles: 0, totalFiles: 0)) == .preparing)
+    }
 }

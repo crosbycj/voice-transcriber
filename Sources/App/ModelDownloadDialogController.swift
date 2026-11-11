@@ -216,36 +216,28 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
         progressIndicator.isHidden = false
         statusLabel.textColor = .secondaryLabelColor
 
-        switch progress.phase {
-        case .listingFiles:
-            if !progressIndicator.isIndeterminate {
-                progressIndicator.isIndeterminate = true
-            }
-            progressIndicator.startAnimation(nil)
-            statusLabel.stringValue = "Checking available model files..."
-        case .downloading(let completedFiles, let totalFiles):
+        switch progress {
+        case .checking:
+            showWorking("Checking available model files...")
+        case .downloading(let fractionCompleted):
             if progressIndicator.isIndeterminate {
                 progressIndicator.stopAnimation(nil)
                 progressIndicator.isIndeterminate = false
             }
-            progressIndicator.doubleValue = progress.fractionCompleted * 100
-            statusLabel.stringValue = Self.downloadStatus(
-                fractionCompleted: progress.fractionCompleted,
-                completedFiles: completedFiles,
-                totalFiles: totalFiles
-            )
-        case .compiling(let modelName):
-            if progressIndicator.isIndeterminate {
-                progressIndicator.stopAnimation(nil)
-                progressIndicator.isIndeterminate = false
-            }
-            progressIndicator.doubleValue = progress.fractionCompleted * 100
-            if modelName.isEmpty {
-                statusLabel.stringValue = "Preparing model..."
-            } else {
-                statusLabel.stringValue = "Preparing model... \(Self.percentString(progress.fractionCompleted))"
-            }
+            progressIndicator.doubleValue = fractionCompleted * 100
+            statusLabel.stringValue = "Downloading model... \(Self.percentString(fractionCompleted))"
+        case .preparing:
+            // Nothing reports progress here, so show that it's alive rather than a bar that looks stuck.
+            showWorking("Getting the model ready for your Mac. This can take a few minutes the first time.")
         }
+    }
+
+    private func showWorking(_ status: String) {
+        if !progressIndicator.isIndeterminate {
+            progressIndicator.isIndeterminate = true
+            progressIndicator.startAnimation(nil)
+        }
+        statusLabel.stringValue = status
     }
 
     private func handleFailure(_ error: Error) {
@@ -288,20 +280,5 @@ final class ModelDownloadDialogController: NSObject, NSWindowDelegate {
     private static func percentString(_ fractionCompleted: Double) -> String {
         let percent = Int((fractionCompleted * 100).rounded())
         return "\(max(0, min(percent, 100)))%"
-    }
-
-    private static func downloadStatus(
-        fractionCompleted: Double,
-        completedFiles: Int,
-        totalFiles: Int
-    ) -> String {
-        let percent = percentString(fractionCompleted)
-
-        guard totalFiles > 0 else {
-            return "Downloading model... \(percent)"
-        }
-
-        let currentFile = min(max(completedFiles + 1, 1), totalFiles)
-        return "Downloading model... \(percent) (\(currentFile) of \(totalFiles) files)"
     }
 }

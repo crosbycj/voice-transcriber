@@ -28,20 +28,15 @@ public struct Transcription: Equatable, Sendable {
     }
 }
 
-public enum TranscriptionModelPreparationPhase: Sendable {
-    case listingFiles
-    case downloading(completedFiles: Int, totalFiles: Int)
-    case compiling(modelName: String)
-}
-
-public struct TranscriptionModelPreparationProgress: Sendable {
-    public let fractionCompleted: Double
-    public let phase: TranscriptionModelPreparationPhase
-
-    public init(fractionCompleted: Double, phase: TranscriptionModelPreparationPhase) {
-        self.fractionCompleted = fractionCompleted
-        self.phase = phase
-    }
+/// Where getting the model ready has got to, in the terms someone waiting on it cares about.
+public enum TranscriptionModelPreparationProgress: Sendable, Equatable {
+    /// Asking the server which files to fetch.
+    case checking
+    /// Fetching the model, this far through (0 to 1).
+    case downloading(fractionCompleted: Double)
+    /// macOS is compiling the model for this Mac's Neural Engine. It reports no progress, and can take
+    /// several minutes the first time on a smaller Mac.
+    case preparing
 }
 
 public typealias TranscriptionModelPreparationProgressHandler = @Sendable (TranscriptionModelPreparationProgress) -> Void

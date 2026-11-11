@@ -284,22 +284,21 @@ public actor ParakeetTranscriptionEngine: TranscriptionEngine {
         return false
     }
 
-    private static func preparationProgress(from downloadProgress: DownloadProgress) -> TranscriptionModelPreparationProgress {
-        let phase: TranscriptionModelPreparationPhase
-
-        switch downloadProgress.phase {
+    /// Turns FluidAudio's progress into what the person waiting needs to know.
+    ///
+    /// FluidAudio reports each part of the model separately, from 0 to 1, with the download taking the
+    /// first half and compiling the second. The first part downloads every file; the rest find them on disk
+    /// and report an empty download. Read raw, the bar would sit at 50% while compiling, then jump between
+    /// 50% and 100% for each part.
+    static func preparationProgress(from progress: DownloadProgress) -> TranscriptionModelPreparationProgress {
+        switch progress.phase {
         case .listing:
-            phase = .listingFiles
-        case .downloading(let completedFiles, let totalFiles):
-            phase = .downloading(completedFiles: completedFiles, totalFiles: totalFiles)
-        case .compiling(let modelName):
-            phase = .compiling(modelName: modelName)
+            return .checking
+        case .downloading(_, let totalFiles) where totalFiles > 0:
+            return .downloading(fractionCompleted: min(max(progress.fractionCompleted / 0.5, 0), 1))
+        case .downloading, .compiling:
+            return .preparing
         }
-
-        return TranscriptionModelPreparationProgress(
-            fractionCompleted: downloadProgress.fractionCompleted,
-            phase: phase
-        )
     }
 }
 
